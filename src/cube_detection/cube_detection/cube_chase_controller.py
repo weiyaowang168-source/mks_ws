@@ -5,47 +5,61 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import Twist, PoseArray
+from geometry_msgs.msg import PoseArray
+from std_msgs.msg import Float64
 
 
-class CubeChaseController(Node):
+class CubeChaseWheelSpeedController(Node):
     """
-    Minimal visual-servo controller:
+    Visual-servo controller (PoseArray -> wheel speed commands)
+
     - Sub:  /cube_poses (PoseArray)   # positions are in camera frame (X,Y,Z) meters
-    - Pub:  /cmd_vel   (Twist)
+    - Pub:  front_left/commands/motor/speed   (Float64)
+            front_right/commands/motor/speed  (Float64)
+            rear_left/commands/motor/speed    (Float64)
+            rear_right/commands/motor/speed   (Float64)
 
     Logic:
     - Choose nearest cube (min Z)
-    - Angular control: omega = -k_w * X   (turn to reduce lateral offset)
-    - Linear control:  v = k_v * (Z - target_z)
+    - Angular control:  ang_cmd = -k_w * X
+    - Linear control:   lin_cmd = k_v * (Z - target_z)
+    - Mixer: left = lin_cmd - ang_cmd, right = lin_cmd + ang_cmd
     """
 
     def __init__(self):
-        super().__init__("cube_chase_controller")
+        super().__init__("cube_chase_wheel_speed_controller")
 
         # ===== Params (tune on-site) =====
-        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("pose_topic", "/cube_poses")
-
         self.declare_parameter("enable", True)
 
         # target distance to stop in front of cube
         self.declare_parameter("target_z", 0.60)          # meters
         self.declare_parameter("z_stop_deadband", 0.08)   # meters
 
-        # gains
-        self.declare_parameter("k_v", 0.8)   # linear gain
-        self.declare_parameter("k_w", 2.0)   # angular gain
+        # "control gains" (still computed from X,Z)
+        self.declare_parameter("k_v", 0.8)   # linear gain (based on z_err)
+        self.declare_parameter("k_w", 2.0)   # angular gain (based on X)
 
-        # limits
-        self.declare_parameter("v_max", 0.35)      # m/s
-        self.declare_parameter("w_max", 1.2)       # rad/s
+        # IMPORTANT: now we output "motor speed units", so we need scaling
+        # If your driver expects eRPM / ticks/s, tune these two scalers.
+        self.declare_parameter("lin_to_speed", 8000.0)    # speed_units per (m/s-like lin cmd)
+        self.declare_parameter("ang_to_speed", 12000.0)   # speed_units per (rad/s-like ang cmd)
+
+        # limits in motor-speed units (NOT m/s)
+        self.declare_parameter("speed_max", 12000.0)
 
         # safety
         self.declare_parameter("timeout_sec", 0.5)  # if no detection, stop
         self.declare_parameter("publish_rate_hz", 20.0)
 
-        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
+        # wheel command topics
+        self.declare_parameter("fl_topic", "front_left/commands/motor/speed")
+        self.declare_parameter("fr_topic", "front_right/commands/motor/speed")
+        self.declare_parameter("rl_topic", "rear_left/commands/motor/speed")
+        self.declare_parameter("rr_topic", "rear_right/commands/motor/speed")
+
+        # ===== Read params =====
         self.pose_topic = self.get_parameter("pose_topic").value
         self.enable = bool(self.get_parameter("enable").value)
 
@@ -55,15 +69,26 @@ class CubeChaseController(Node):
         self.k_v = float(self.get_parameter("k_v").value)
         self.k_w = float(self.get_parameter("k_w").value)
 
-        self.v_max = float(self.get_parameter("v_max").value)
-        self.w_max = float(self.get_parameter("w_max").value)
+        self.lin_to_speed = float(self.get_parameter("lin_to_speed").value)
+        self.ang_to_speed = float(self.get_parameter("ang_to_speed").value)
+
+        self.speed_max = float(self.get_parameter("speed_max").value)
 
         self.timeout_sec = float(self.get_parameter("timeout_sec").value)
         self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
 
+        fl_topic = self.get_parameter("fl_topic").value
+        fr_topic = self.get_parameter("fr_topic").value
+        rl_topic = self.get_parameter("rl_topic").value
+        rr_topic = self.get_parameter("rr_topic").value
+
         # ===== ROS I/O =====
         self.sub = self.create_subscription(PoseArray, self.pose_topic, self.on_poses, 10)
-        self.pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+
+        self.fl_pub = self.create_publisher(Float64, fl_topic, 10)
+        self.fr_pub = self.create_publisher(Float64, fr_topic, 10)
+        self.rl_pub = self.create_publisher(Float64, rl_topic, 10)
+        self.rr_pub = self.create_publisher(Float64, rr_topic, 10)
 
         self.last_msg_time: Optional[float] = None
         self.latest_poses: Optional[PoseArray] = None
@@ -72,7 +97,8 @@ class CubeChaseController(Node):
         self.timer = self.create_timer(period, self.control_loop)
 
         self.get_logger().info(
-            f"CubeChaseController started. Sub={self.pose_topic} Pub={self.cmd_vel_topic}"
+            f"CubeChaseWheelSpeedController started. Sub={self.pose_topic} "
+            f"Pub=[{fl_topic}, {fr_topic}, {rl_topic}, {rr_topic}]"
         )
 
     def on_poses(self, msg: PoseArray):
@@ -102,7 +128,8 @@ class CubeChaseController(Node):
         X = float(best.position.x)  # left/right in camera frame
         Z = float(best.position.z)  # forward distance
 
-        # angular: turn to reduce X (sign might need flipping on-site)
+        # your original v,w logic (conceptually)
+        # angular: turn to reduce X
         w = -self.k_w * X
 
         # linear: approach target_z
@@ -112,26 +139,34 @@ class CubeChaseController(Node):
         else:
             v = self.k_v * z_err
 
-        # clamp
-        v = max(-self.v_max, min(self.v_max, v))
-        w = max(-self.w_max, min(self.w_max, w))
+        # ===== Convert v,w to motor-speed units =====
+        lin_cmd = v * self.lin_to_speed
+        ang_cmd = w * self.ang_to_speed
 
-        # publish
-        cmd = Twist()
-        cmd.linear.x = v
-        cmd.angular.z = w
-        self.pub.publish(cmd)
+        # ===== Mixer (same as your auto_velocity_control) =====
+        left_speed = lin_cmd - ang_cmd
+        right_speed = lin_cmd + ang_cmd
+
+        # clamp
+        left_speed = max(-self.speed_max, min(self.speed_max, left_speed))
+        right_speed = max(-self.speed_max, min(self.speed_max, right_speed))
+
+        # publish 4 wheels
+        self.publish_wheels(left_speed, right_speed)
+
+    def publish_wheels(self, left_speed: float, right_speed: float):
+        self.fl_pub.publish(Float64(data=float(left_speed)))
+        self.rl_pub.publish(Float64(data=float(left_speed)))
+        self.fr_pub.publish(Float64(data=float(right_speed)))
+        self.rr_pub.publish(Float64(data=float(right_speed)))
 
     def publish_stop(self):
-        cmd = Twist()
-        cmd.linear.x = 0.0
-        cmd.angular.z = 0.0
-        self.pub.publish(cmd)
+        self.publish_wheels(0.0, 0.0)
 
 
 def main():
     rclpy.init()
-    node = CubeChaseController()
+    node = CubeChaseWheelSpeedController()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
